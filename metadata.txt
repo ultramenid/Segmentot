@@ -5,7 +5,7 @@ qgisMaximumVersion=4.99
 supportsQt6=True
 description=Local click segmentation: click an object on any imagery layer and get its outline as a polygon (SAM 2.1, the lighter EdgeTAM or SAM 3, on an NVIDIA GPU, Apple M-series or the CPU). No account, no cloud.
 about=Detects the NVIDIA GPU and installs the matching CUDA build of PyTorch (about 4-5 GB), or Metal on Apple M-series; falls back to the CPU if the GPU cannot be used. Left-click to include, right-click to exclude, Enter to save. Hover preview, alternative outlines and refine options (expand, simplify, fill holes, square corners, smooth). On first use it installs its own engine (private Python + PyTorch), either online or without internet from an engine package file, picks NVIDIA CUDA, Apple Metal or CPU automatically, and then asks before downloading the model you pick (56 MB to 3.4 GB) from Hugging Face. Linux, Windows and macOS. Imagery never leaves the computer.
-version=0.0.1
+version=0.0.2
 author=Muhammad Alichamdan, Dika_John
 email=malichamdan@gmail.com, komiu.maniso@gmail.com
 homepage=https://github.com/ultramenid/Segmentot
@@ -18,7 +18,9 @@ deprecated=False
 hasProcessingProvider=no
 server=False
 tags=segmentation,segment anything,sam,sam2,sam3,ai,deep learning,digitizing,raster,polygon,building,gpu
-changelog=0.0.1
+changelog=0.0.2
+    - The uv checksums are marked as public, so the plugin site's secret scan passes. No change in behaviour
+    0.0.1
     - First release under the name Segmentot
     - Guided panel: two setup steps, then imagery, save layer and click
     - Models: EdgeTAM, SAM 2.1 (Tiny, Small, Base+, Large) and SAM 3; download, switch and delete in Settings
