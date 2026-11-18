@@ -5,12 +5,16 @@ Run with QGIS's own Python, e.g. on macOS:
       /Applications/QGIS.app/Contents/MacOS/python -s -P tests/test_engine.py
 SEGMENTOT_TEST_PARENT defaults to the folder that contains this repo.
 """
+import hmac
+import json
 import math
 import os
 import sys
 import tempfile
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest import mock
 
 sys.path.insert(0, os.environ.get("SEGMENTOT_TEST_PARENT") or
                 os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -26,7 +30,7 @@ gdal.UseExceptions()
 APP = QgsApplication([], False)
 APP.initQgis()
 
-from Segmentot.core import engine  # noqa: E402
+from Segmentot.core import engine, runtime  # noqa: E402
 from Segmentot.gui.click_tool import WINDOW_PX, window_at, window_res  # noqa: E402
 
 CRS = QgsCoordinateReferenceSystem("EPSG:32633")      # metres
@@ -161,6 +165,82 @@ class Render(unittest.TestCase):
 
     def test_cancelled_render_still_calls_back(self):
         self.render(cancel=True)
+
+
+class Trust(unittest.TestCase):
+    """The plugin trusts a reply only when it carries the proof made with the key in the engine folder."""
+    proof = staticmethod(lambda key, port, nonce: hmac.new(
+        key.encode(), "{}:{}".format(port, nonce).encode(), "sha256").hexdigest())
+
+    def setUp(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        env = mock.patch.dict(os.environ, {"SEGMENTOT_HOME": home.name})
+        env.start()
+        self.addCleanup(env.stop)
+        self.key = runtime.engine_key(create=True)
+        test = self
+        test.answer = lambda port, nonce: None        # the X-Segmentot-Proof the program on the port sends
+        test.code = 200
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = json.dumps({"ok": True, "engine": "segmentot", "error": "boom"}).encode()
+                self.send_response(test.code)
+                self.send_header("Content-Length", str(len(body)))
+                proof = test.answer(self.server.server_port, self.headers.get("X-Segmentot-Nonce"))
+                if proof:
+                    self.send_header("X-Segmentot-Proof", proof)
+                self.end_headers()
+                self.wfile.write(body)
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        old = dict(engine._cfg)
+        self.addCleanup(engine._cfg.update, old)
+        engine.configure(self.port, "base")
+
+    def refused(self, call=None):
+        with self.assertRaises(engine.EngineError) as e:
+            (call or (lambda: engine._call("/health", timeout=5)))()
+        self.assertNotIsInstance(e.exception, engine.EngineUnreachable)
+        self.assertIn("another program", str(e.exception))
+
+    def test_our_engine_is_trusted(self):
+        self.answer = lambda port, nonce: self.proof(self.key, port, nonce)
+        self.assertTrue(engine._call("/health", timeout=5)["ok"])
+        self.assertTrue(engine.ensure_engine()["ok"])
+        self.code = 500                               # its own error message is shown as it is
+        with self.assertRaises(engine.EngineError) as e:
+            engine._call("/health", timeout=5)
+        self.assertEqual(str(e.exception), "boom")
+
+    def test_another_program_on_the_port_is_refused(self):
+        for name, answer in (("no proof", lambda port, nonce: None),
+                             ("made up", lambda port, nonce: "0" * 64),
+                             ("not ascii", lambda port, nonce: "\xe9" * 8),
+                             ("another key", lambda port, nonce: self.proof("f" * 64, port, nonce)),
+                             ("our engine on another port", lambda port, nonce: self.proof(self.key, port + 1, nonce)),
+                             ("an old answer", lambda port, nonce: self.proof(self.key, port, "0" * 32))):
+            with self.subTest(name):
+                self.answer = answer
+                self.refused()
+                self.code = 500
+                self.refused()
+                self.code = 200
+                with mock.patch.object(runtime, "start_engine") as start:
+                    self.refused(engine.ensure_engine)        # and no second engine is started on that port
+                self.assertFalse(start.called)
+
+    def test_without_a_key_nothing_is_trusted(self):
+        os.remove(os.path.join(runtime.home(), "engine.key"))
+        self.answer = lambda port, nonce: self.proof("", port, nonce)
+        self.refused()
 
 
 class Window(unittest.TestCase):

@@ -48,7 +48,7 @@ class RemoveAll(HomeTest):
         uv = os.path.basename(runtime.uv_path())
         for parts in (("bin", uv), ("bin", uv + ".part"),
                       ("python", "cpython-3.12", "lib.so"), ("venv", "pyvenv.cfg"), ("hf", "hub", "x"),
-                      ("cache", "wheel"), ("env.json",), ("engine.log",)):
+                      ("cache", "wheel"), ("env.json",), ("engine.log",), ("engine.key",)):
             self.touch(*parts)
 
     def test_keeps_unrelated_files(self):
@@ -63,6 +63,23 @@ class RemoveAll(HomeTest):
         self.make_engine()
         runtime.remove_all()
         self.assertFalse(os.path.exists(self.home))
+
+
+class EngineKey(HomeTest):
+    def test_made_once_and_private(self):
+        self.assertIsNone(runtime.engine_key())                 # looking never makes one
+        self.assertEqual(os.listdir(self.home), [])
+        key = runtime.engine_key(create=True)
+        self.assertEqual(len(key), 64)
+        self.assertEqual(runtime.engine_key(), key)
+        self.assertEqual(runtime.engine_key(create=True), key)
+        if os.name != "nt":
+            self.assertEqual(os.stat(os.path.join(self.home, "engine.key")).st_mode & 0o777, 0o600)
+
+    def test_empty_file_is_replaced(self):
+        self.touch("engine.key", data=b"")
+        self.assertIsNone(runtime.engine_key())
+        self.assertEqual(len(runtime.engine_key(create=True)), 64)
 
 
 class ModelDownloaded(HomeTest):
@@ -408,6 +425,17 @@ class ModelIsSeparate(HomeTest):
             runtime.start_engine(8776, "base")
         self.addCleanup(setattr, runtime, "_proc", None)
         self.assertEqual(popen.call_args.kwargs["env"]["HF_HUB_OFFLINE"], "1")
+
+    def test_engine_gets_the_key_by_the_environment_only(self):
+        with mock.patch.object(runtime, "is_ready", return_value=True), \
+                mock.patch.object(runtime.subprocess, "Popen") as popen:
+            runtime.start_engine(8776, "base")
+        self.addCleanup(setattr, runtime, "_proc", None)
+        key = runtime.engine_key()
+        self.assertEqual(popen.call_args.kwargs["env"]["SEGMENTOT_KEY"], key)
+        self.assertNotIn(key, " ".join(popen.call_args.args[0]))
+        with open(os.path.join(self.home, "engine.log")) as f:
+            self.assertNotIn(key, f.read())
 
 
 class Pack(HomeTest):

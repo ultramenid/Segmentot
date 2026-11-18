@@ -1,7 +1,9 @@
 """Talking to the local Segmentot engine, rendering map windows for it, and shaping results."""
 import base64
+import hmac
 import json
 import os
+import secrets
 import threading
 import time
 import urllib.error
@@ -43,23 +45,35 @@ def url():
     return "http://127.0.0.1:{}".format(_cfg["port"])
 
 
+def _check(headers, nonce):
+    """Trust a reply only from this computer's engine: it alone knows the key in the engine folder, so a
+    program that took the port cannot pass for it (and is never sent imagery). The port is part of the proof,
+    so the reply of an engine on another port cannot be passed on either."""
+    key = runtime.engine_key()
+    want = hmac.new((key or "").encode(), "{}:{}".format(_cfg["port"], nonce).encode(), "sha256").hexdigest()
+    got = (headers.get("X-Segmentot-Proof") or "").encode("ascii", "replace")
+    if not key or not hmac.compare_digest(want.encode(), got):
+        raise EngineError("Port {} is used by another program (its reply is not from this computer's Segmentot "
+                          "engine). Change the port in Segmentot's engine settings.".format(_cfg["port"]))
+
+
 def _call(path, payload=None, timeout=300, headers=None):
     data = None if payload is None else json.dumps(payload).encode()
-    h = {"Content-Type": "application/json", "X-Segmentot": "1"}
+    nonce = secrets.token_hex(16)
+    h = {"Content-Type": "application/json", "X-Segmentot": "1", "X-Segmentot-Nonce": nonce}
     h.update(headers or {})
     req = urllib.request.Request(url() + path, data=data, headers=h)
     try:
         with _opener.open(req, timeout=timeout) as r:
+            _check(r.headers, nonce)
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
+        _check(e.headers, nonce)
         try:
             msg = json.loads(e.read()).get("error", str(e))
         except Exception:
             msg = str(e)
         raise EngineError(msg)
-    except ValueError:
-        raise EngineError("Port {} is used by another program (its reply is not Segmentot's). Change the port "
-                          "in Segmentot's engine settings.".format(_cfg["port"]))
     except (urllib.error.URLError, ConnectionError, OSError) as e:
         raise EngineUnreachable(str(e))
 
@@ -68,15 +82,9 @@ def ensure_engine(wait_s=120):
     """Make sure an engine answers on the port: use one already running, else start ours."""
     with _start_lock:
         try:
-            r = _call("/health", timeout=5)
-            if not r.get("ok"):
-                raise EngineError("Port {} answers but it is not Segmentot; pick another port.".format(_cfg["port"]))
-            return r
+            return _call("/health", timeout=5)       # EngineError: another program has the port
         except EngineUnreachable:
             pass
-        except EngineError as e:
-            raise EngineError("Port {} is used by another program ({}). Change the port in "
-                              "Segmentot's engine settings.".format(_cfg["port"], e))
         if not runtime.is_ready():
             raise EngineError("Segmentot's AI engine is not installed on this computer yet. "
                               "Click 'Install engine' in the Segmentot panel.")

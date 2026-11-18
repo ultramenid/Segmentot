@@ -119,6 +119,8 @@ Set the environment variable `SEGMENTOT_HOME` to use another folder.
 
 - Imagery is processed on your computer. The engine listens on `127.0.0.1` only and refuses requests
   that do not come from the plugin.
+- The plugin sends imagery only to its own engine. The engine has to prove it knows a secret key kept in
+  the engine folder, so another program that takes the port is refused.
 - The internet is used for two things, both started by you: installing the engine
   (Python from GitHub, packages from PyPI and pytorch.org) and downloading a model (huggingface.co).
 - No telemetry.

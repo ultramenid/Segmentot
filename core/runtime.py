@@ -6,6 +6,7 @@ Everything lives in one folder (SEGMENTOT_HOME or ~/.segmentot, %LOCALAPPDATA%\\
   venv/         engine environment: torch (CUDA / Apple MPS / CPU, chosen by uv), transformers ...
   hf/           model weights: SAM2.1, EdgeTAM (Hugging Face cache)
   env.json      what was installed, for which hardware
+  engine.key    secret the engine proves it knows, so the plugin never talks to another program on its port
   engine.log    engine output
 No QGIS imports: safe to use from background tasks and threads.
 """
@@ -17,6 +18,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import subprocess  # running its own engine (uv, python) is what this module is for  # nosec B404
 import tarfile
@@ -66,6 +68,30 @@ def save_hf_token(token):
     fd = os.open(token_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)      # readable by this user only
     with os.fdopen(fd, "w") as f:
         f.write(token.strip())
+
+
+def engine_key(create=False):
+    """The secret our engine proves it knows in every answer (engine.py checks it). None when there is none;
+    start_engine() makes it. Readable by this user only, like the access token."""
+    path = os.path.join(home(), "engine.key")
+    try:
+        with open(path) as f:
+            key = f.read().strip()
+        if key or not create:
+            return key or None
+        os.remove(path)                      # left empty by a crash
+    except OSError:
+        if not create:
+            return None
+    os.makedirs(home(), exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:                  # another QGIS made it just now
+        return engine_key()
+    key = secrets.token_hex(32)
+    with os.fdopen(fd, "w") as f:
+        f.write(key)
+    return key
 
 
 NO_WINDOW = 0x08000000 if WIN else 0     # CREATE_NO_WINDOW
@@ -698,7 +724,8 @@ def remove_all():
     """Delete only what setup() created: SEGMENTOT_HOME may be a folder that also holds the user's own files."""
     stop_engine()
     h = home()
-    for p in (uv_path(), uv_path() + ".part", os.path.join(h, "env.json"), os.path.join(h, "engine.log")):
+    for p in (uv_path(), uv_path() + ".part", os.path.join(h, "env.json"), os.path.join(h, "engine.log"),
+              os.path.join(h, "engine.key")):
         try:
             os.remove(p)
         except OSError:
@@ -729,6 +756,9 @@ def start_engine(port, model_key):
             return
         if not is_ready():
             raise SetupError("not installed")
+        key = engine_key(create=True)
+        if not key:
+            raise SetupError("Cannot write the engine key in {}.".format(home()))
         cmd = [venv_python(), "-u", SERVER, "--port", str(port), "--model", MODELS[model_key][0],
                "--parent-pid", str(os.getpid()), "--idle-exit", "1800"]
         if EDITION == "cpu":
@@ -739,7 +769,9 @@ def start_engine(port, model_key):
         kw = {"creationflags": NO_WINDOW} if WIN else {"start_new_session": True}
         # safe for bandit B603: the engine's own python and server script, a list without a shell
         _proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,  # nosec B603
-                                 env=clean_env({"HF_HUB_OFFLINE": "1"}),     # models come from download_model only
+                                 # offline: models come from download_model only. The key goes by the
+                                 # environment, not the command line: other users can read command lines
+                                 env=clean_env({"HF_HUB_OFFLINE": "1", "SEGMENTOT_KEY": key}),
                                  cwd=home(), **kw)
         logf.close()
 

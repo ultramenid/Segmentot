@@ -4,6 +4,7 @@
       --with rasterio python -m unittest tests/test_server.py -v
 """
 import base64
+import hmac
 import http.client
 import importlib.util
 import io
@@ -250,6 +251,20 @@ class Http(Clean):
             self.assertFalse(r["loaded"])
             self.assertEqual(r["device"], srv.S["device"])
             self.assertNotIn("notice", r)
+
+    def test_proves_itself_with_the_key(self):
+        def proof(headers):
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            c.request("GET", "/health", headers=headers)
+            r = c.getresponse()
+            r.read()
+            c.close()
+            return r.getheader("X-Segmentot-Proof")
+        want = hmac.new(b"secret", f"{self.port}:abc".encode(), "sha256").hexdigest()
+        with mock.patch.object(srv, "KEY", b"secret"):
+            self.assertEqual(proof({"X-Segmentot": "1", "X-Segmentot-Nonce": "abc"}), want)
+            self.assertIsNone(proof({"X-Segmentot": "1"}))
+        self.assertIsNone(proof({"X-Segmentot": "1", "X-Segmentot-Nonce": "abc"}))       # started without a key
 
     def test_predict_reports_fallback(self):
         srv.S.update(model=FakeModel(), proc=FakeProc(), device="meta", notice=None)

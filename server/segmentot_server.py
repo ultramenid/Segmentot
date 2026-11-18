@@ -7,6 +7,8 @@ while it works; if it fails the engine moves to the CPU for good and says so in 
 
 Every request needs an X-Segmentot header and Host 127.0.0.1:<port> or localhost:<port>,
 else 403 (keeps web pages in the user's browser out). Bodies over 64 MB get 413.
+A request with an X-Segmentot-Nonce header gets X-Segmentot-Proof back: HMAC-SHA256 of "<port>:<nonce>"
+with the key in SEGMENTOT_KEY. The plugin sends imagery only to an engine that proves itself this way.
 
   GET  /health   -> {"ok", "engine", "device", "gpu", "model", "loaded", "torch", "notice"?}
                     X-Segmentot: load loads the model before answering.
@@ -22,6 +24,7 @@ else 403 (keeps web pages in the user's browser out). Bodies over 64 MB get 413.
 """
 import argparse
 import base64
+import hmac
 import io
 import json
 import os
@@ -42,6 +45,7 @@ from rasterio.features import shapes
 CACHE_IMAGES = 6
 MAX_BODY = 64 * 2**20           # bytes
 MAX_PIXELS = 4096 * 4096        # the client sends 1024 x 1024
+KEY = os.environ.get("SEGMENTOT_KEY", "").encode()      # set by the plugin that starts this engine
 _lock = threading.Lock()
 _last_request = time.time()
 _emb = OrderedDict()            # image_id -> (embeddings, (h, w), valid mask)
@@ -241,6 +245,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        nonce = self.headers.get("X-Segmentot-Nonce")
+        if KEY and nonce:           # proof for the plugin that this is its engine, not another program on the port
+            self.send_header("X-Segmentot-Proof", hmac.new(
+                KEY, f"{self.server.server_port}:{nonce}".encode(), "sha256").hexdigest())
         self.end_headers()
         self.wfile.write(body)
 
