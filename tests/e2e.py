@@ -34,8 +34,15 @@ EPSG = 32748                                              # UTM 48S (Java)
 
 
 # ------------------------------------------------------------------ synthetic imagery with known truth
-def px_poly(pts):
-    return QgsGeometry.fromPolygonXY([[QgsPointXY(OX + x * RES, OY - y * RES) for x, y in pts]])
+def px_poly(pts, holes=()):
+    rings = [[QgsPointXY(OX + x * RES, OY - y * RES) for x, y in pts]]
+    for h in holes:
+        rings.append([QgsPointXY(OX + x * RES, OY - y * RES) for x, y in h])
+    return QgsGeometry.fromPolygonXY(rings)
+
+
+def px_pt(x, y):
+    return QgsPointXY(OX + x * RES, OY - y * RES)
 
 
 def rect(x0, y0, x1, y1):
@@ -77,6 +84,27 @@ def make_image(path):
     truth["lake"] = px_poly([(500 + 180 * np.cos(k), 1100 + 120 * np.sin(k)) for k in t])
     paint((xx >= 1400) & (xx < 2900) & (yy >= 300) & (yy < 1500), (190, 170, 90))
     truth["field"] = px_poly(rect(1400, 300, 2900, 1500))          # 1500 x 1200 px: bigger than one window
+    block = (xx >= 850) & (xx < 1150) & (yy >= 1850) & (yy < 2150)
+    img[block] += rng.normal(0, 35, (int(block.sum()), 3))         # speckle, like real imagery
+    paint((xx >= 990) & (xx < 1010) & (yy >= 1990) & (yy < 2010), (240, 240, 240), noise=35.0)
+    truth["speck"] = px_poly(rect(990, 1990, 1010, 2010))
+    # courtyard building: 200 x 200 outer with an 80 x 80 inner courtyard
+    court_out = (xx >= 1600) & (xx < 1800) & (yy >= 1900) & (yy < 2100)
+    court_in = (xx >= 1660) & (xx < 1740) & (yy >= 1960) & (yy < 2040)
+    paint(court_out & ~court_in, (185, 95, 75), noise=5.0)
+    truth["courtyard"] = px_poly(rect(1600, 1900, 1800, 2100), [rect(1660, 1960, 1740, 2040)])
+    # hierarchical compound: pad -> building -> bright skylight unit
+    paint((xx >= 2100) & (xx < 2400) & (yy >= 1880) & (yy < 2120), (150, 150, 145), noise=5.0)
+    paint((xx >= 2140) & (xx < 2360) & (yy >= 1920) & (yy < 2080), (190, 90, 60), noise=5.0)
+    paint((xx >= 2220) & (xx < 2280) & (yy >= 1970) & (yy < 2030), (235, 235, 240), noise=4.0)
+    truth["compound_pad"] = px_poly(rect(2100, 1880, 2400, 2120))
+    truth["compound_bldg"] = px_poly(rect(2140, 1920, 2360, 2080))
+    truth["compound_unit"] = px_poly(rect(2220, 1970, 2280, 2030))
+    # off-center auto-recenter pair: anchor opens a window that clips edge_bldg on the left
+    paint((xx >= 770) & (xx < 830) & (yy >= 2320) & (yy < 2380), (210, 180, 70), noise=5.0)
+    truth["anchor"] = px_poly(rect(770, 2320, 830, 2380))
+    paint((xx >= 150) & (xx < 550) & (yy >= 2200) & (yy < 2500), (175, 85, 65), noise=5.0)
+    truth["edge_bldg"] = px_poly(rect(150, 2200, 550, 2500))
     img = np.clip(img, 1, 255)
     img[lake] = 0
     ds = gdal.GetDriverByName("GTiff").Create(path, N, N, 3, gdal.GDT_Byte, ["TILED=YES", "COMPRESS=DEFLATE"])
@@ -304,6 +332,7 @@ def main():
         plugin.start_btn.setChecked(True)
         R.check("panel: Start activates the map tool and the action buttons", canvas.mapTool() is tool
                 and all(b.isEnabled() for b in plugin.actions) and not plugin.keys.isHidden(), plugin.status.text())
+        R.check("engine: kept awake while Start is on", plugin._alive.isActive())
         t0 = time.time()
         health = engine.call("/health", timeout=600, headers={"X-Segmentot": "load"})
         print("Engine start + model load: {:.1f} s | {}".format(time.time() - t0, health), flush=True)
@@ -352,6 +381,7 @@ def main():
         # ---- 4. Smooth outline keeps the area of a small object (finding 9)
         view(centre(truth["small"]), RES)
         plugin.outline.setCurrentIndex(1)
+        tool.new_imagery()                 # a new window centred on the object, not a kept one where it is off-centre
         pump(0.2)
         t, s = click(centre(truth["small"]))
         a, ta = tool.geom.area(), truth["small"].area()
@@ -384,6 +414,61 @@ def main():
         plugin.smooth.setChecked(False)
         key(Qt.Key.Key_Escape)
 
+        # ---- 5b. Square corners on an axis-aligned building keeps full IoU
+        view(centre(truth["building"]), RES)
+        t, s = click(centre(truth["building"]))
+        plugin.square.setChecked(True)
+        pump(0.2)
+        sq = tool.geom
+        v = iou(sq, truth["building"])
+        R.check("refine: Square corners keeps an axis-aligned building",
+                sq.constGet().nCoordinates() <= 6 and v >= 0.97,
+                "{} vertices, IoU {:.3f}".format(sq.constGet().nCoordinates(), v))
+        plugin.square.setChecked(False)
+        key(Qt.Key.Key_Escape)
+
+        # ---- 5c. Courtyard building: roof click + right-click inside courtyard hole
+        view(px_pt(1700, 2000), RES)
+        click(px_pt(1630, 1930))
+        click(px_pt(1700, 2000), Qt.MouseButton.RightButton)
+        g = tool.geom
+        holes = sum(len(p) - 1 for p in (g.asMultiPolygon() if g.isMultipart() else [g.asPolygon()]))
+        v = iou(g, truth["courtyard"])
+        R.check("accuracy: courtyard building keeps its inner courtyard hole",
+                v >= 0.95 and holes >= 1, "IoU {:.3f}, {} hole(s)".format(v, holes))
+        key(Qt.Key.Key_Escape)
+
+        # ---- 5d. Hierarchical compound: C selects building, right-click on pad keeps granularity via mask_id
+        view(px_pt(2250, 2000), RES)
+        click(px_pt(2250, 2000))
+        best_v, best_idx = -1.0, 0
+        for _ in range(len(tool.candidates)):
+            cv = iou(tool.geom, truth["compound_bldg"])
+            if cv > best_v:
+                best_v, best_idx = cv, tool.cand_idx
+            key(Qt.Key.Key_C)
+        while tool.cand_idx != best_idx:
+            key(Qt.Key.Key_C)
+        click(px_pt(2115, 2000), Qt.MouseButton.RightButton)
+        v = iou(tool.geom, truth["compound_bldg"])
+        R.check("accuracy: C candidate choice survives a refine click",
+                len(tool.candidates) >= 1 and best_v >= 0.8 and v >= 0.92,
+                "chosen cand IoU {:.3f} -> after exclude click {:.3f}".format(best_v, v))
+        key(Qt.Key.Key_Escape)
+
+        # ---- 5e. Off-center click inside a cached window auto-recenters instead of clipping the object
+        view(px_pt(650, 2350), RES)
+        tool.new_imagery()
+        click(centre(truth["anchor"]))
+        cached_id = tool.image_id
+        key(Qt.Key.Key_Escape)
+        t, s = click(px_pt(480, 2350))          # inside INNER of cached window, but edge_bldg hits its left edge
+        v = iou(tool.geom, truth["edge_bldg"])
+        R.check("accuracy: off-center clipped object in a cached window auto-recenters",
+                tool.image_id != cached_id and v >= 0.95 and "frame" not in s.lower(),
+                "recentered={}, IoU {:.3f}, {:.2f} s".format(tool.image_id != cached_id, v, t))
+        key(Qt.Key.Key_Escape)
+
         # ---- 6. exclude click, Enter too early, then save (findings 6, 7)
         view(centre(truth["building"]), RES)
         c = centre(truth["building"])
@@ -395,10 +480,13 @@ def main():
         before = count()
         n = len(statuses)
         tool.canvasReleaseEvent(mouse(c))
+        waiting = canvas.cursor().shape()
         tool.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier))
         R.check("save: Enter before the outline arrives saves nothing", count() == before and bool(tool.points),
                 "status: {!r}".format(statuses[-1]))
         wait(lambda: any(x.startswith("Score") for x in statuses[n:]) and not tool.busy, 60, "the outline")
+        R.check("click: the map shows a busy cursor until the outline arrives",
+                waiting == Qt.CursorShape.BusyCursor and canvas.cursor().shape() == Qt.CursorShape.CrossCursor)
         key(Qt.Key.Key_Return)
         R.check("save: Enter after the outline arrives saves", count() == before + 1, "{} features".format(count()))
 
@@ -445,6 +533,11 @@ def main():
         R.check("accuracy: zooming out captures the whole field in raster-pixel mode",
                 abs(tool.res - RES * 4) < 1e-9 and v >= 0.95 and "frame" not in s.lower(),
                 "window {:.2f} m/px, IoU {:.3f}, {:.2f} s".format(tool.res, v, t))
+        # an exclude click in the middle of an even object says little: it must not wreck the outline
+        a0 = tool.geom.area()
+        click(QgsPointXY(fc.x() + 150, fc.y() + 100), Qt.MouseButton.RightButton)
+        R.check("click: an exclude click inside a big even object does not collapse its outline",
+                tool.geom.area() >= 0.5 * a0, "{:.0f} -> {:.0f} m²".format(a0, tool.geom.area()))
         key(Qt.Key.Key_Escape)
 
         # ---- 9. map-zoom mode follows the zoom (finding 3)
@@ -476,21 +569,52 @@ def main():
             print(e)
         R.check("hover: preview outline appears under the cursor", v >= 0.9, "IoU {:.3f}".format(v))
 
-        # ---- 11. speed of a warm click
-        view(centre(truth["building"]), RES)
+        # ---- 10c. a small object in speckled imagery: the hint, then Map zoom and zooming in sharpens it
+        sp = centre(truth["speck"])
+        view(sp, RES)
+        t, s = click(sp)
+        v1 = iou(tool.geom, truth["speck"])
         key(Qt.Key.Key_Escape)
-        t1, _ = click(centre(truth["building"]))
+        plugin.detail.setCurrentIndex(1)
+        view(sp, RES / 4)
+        click(sp)
+        v2 = iou(tool.geom, truth["speck"])
+        R.check("accuracy: a small object gets the Map zoom hint, and zooming in there sharpens it",
+                "Small object" in s and "Map zoom" in s and v1 >= 0.7 and v2 >= 0.9,
+                "IoU {:.3f} at raster pixels, {:.3f} zoomed in 4x".format(v1, v2))
+        key(Qt.Key.Key_Escape)
+        plugin.detail.setCurrentIndex(0)
+        pump(0.2)
+
+        # ---- 11. speed: a new window, a click inside it, and going back to an earlier window
+        view(b, RES)
+        tool.new_imagery()
+        t1, _ = click(b)
+        first = tool.image_id
+        key(Qt.Key.Key_Escape)
         t2, _ = click(QgsPointXY(b.x() + 5, b.y() + 3))
         key(Qt.Key.Key_Escape)
-        print("Warm click: new window {:.2f} s, same window {:.2f} s".format(t1, t2), flush=True)
+        click(centre(truth["rotated"]))             # 200 m away: outside the middle of the first window
+        other = tool.image_id
+        key(Qt.Key.Key_Escape)
+        t3, _ = click(b)
+        print("Click: new window {:.2f} s, same window {:.2f} s, back to an earlier window {:.2f} s".format(
+            t1, t2, t3), flush=True)
+        R.check("speed: a click that opens a new window answers within 10 s", t1 < 10.0, "{:.2f} s".format(t1))
         R.check("speed: a click in an existing window answers within 3 s", t2 < 3.0, "{:.2f} s".format(t2))
+        R.check("speed: going back to an earlier window reuses it", other != first and tool.image_id == first
+                and t3 < 3.0, "{:.2f} s".format(t3))
+        key(Qt.Key.Key_Escape)
+        layer.emitStyleChanged()
+        R.check("imagery: a style change drops the kept windows", tool.window is None and not tool.views)
     except Exception:
         R.check("run completed without an exception", False, traceback.format_exc()[-1500:])
     finally:
         try:
             plugin.unload()
             pump(0.5)
-            R.check("unload: plugin unloads and stops its engine", not runtime.engine_running_here())
+            R.check("unload: plugin unloads and stops its engine", not runtime.engine_running_here()
+                    and not plugin._alive.isActive())
         except Exception:
             R.check("unload: plugin unloads and stops its engine", False, traceback.format_exc()[-800:])
     if iface.bar_messages:

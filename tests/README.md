@@ -18,7 +18,7 @@ image with objects at known positions.
 window, and installs the package into a temporary engine folder (its engine uses its own port).
 `fallback_real.py` loads the real model on the GPU, injects a GPU failure and checks the CPU takes over.
 `SEGMENTOT_TEST_MODEL=edge $QGIS_PY tests/e2e.py` runs the end-to-end test with another model
-(the accuracy limits are set for Base+: EdgeTAM misses "Square corners" by one corner point).
+(the accuracy limits are tuned for Base+; EdgeTAM also passes the suite).
 
 `$QGIS_PY` on macOS (QGIS.app bundle):
 

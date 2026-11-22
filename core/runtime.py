@@ -35,7 +35,8 @@ EDITION_LABEL = {"cpu": "CPU edition", "gpu": "GPU edition"}.get(EDITION, "")
 SERVER = os.path.join(PLUGIN_DIR, "server", "segmentot_server.py")
 ENV_VERSION = 1                      # bump when the engine's requirements change
 PYTHON_VERSION = "3.12"
-PACKAGES = ["transformers>=4.57,<6", "huggingface_hub", "safetensors", "pillow", "numpy",
+# transformers holds the model code: pinned to the release the end-to-end test (tests/e2e.py) passed with
+PACKAGES = ["transformers==5.23.*", "huggingface_hub", "safetensors", "pillow", "numpy",
             "opencv-python-headless", "rasterio", "timm"]        # timm: EdgeTAM's image encoder
 MODELS = {                           # key -> (Hugging Face id, label, download size in MB)
     "edge": ("yonigozlan/EdgeTAM-hf", "EdgeTAM (fastest, smallest)", 56),
@@ -195,14 +196,14 @@ def clean_env(extra=None):
     for k in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE", "PYTHONEXECUTABLE",
               "VIRTUAL_ENV", "CONDA_PREFIX", "LD_LIBRARY_PATH", "LD_PRELOAD", "DYLD_LIBRARY_PATH",
               "DYLD_FALLBACK_LIBRARY_PATH", "GDAL_DATA", "GDAL_DRIVER_PATH", "PROJ_LIB", "PROJ_DATA",
-              "QT_PLUGIN_PATH", "SSL_CERT_FILE"):
+              "QT_PLUGIN_PATH", "SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
         env.pop(k, None)
     h = home()
     env.update({"UV_PYTHON_INSTALL_DIR": os.path.join(h, "python"), "UV_CACHE_DIR": os.path.join(h, "cache"),
                 "UV_PYTHON_PREFERENCE": "only-managed", "UV_NO_CONFIG": "1",
                 "HF_HOME": os.path.join(h, "hf"), "HF_HUB_DISABLE_TELEMETRY": "1",
                 "PYTHONNOUSERSITE": "1", "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1",
-                "PYTORCH_ENABLE_MPS_FALLBACK": "1"})
+                "PYTORCH_ENABLE_MPS_FALLBACK": "1", "CUDA_MODULE_LOADING": "LAZY"})
     env.update(extra or {})
     return env
 
@@ -388,20 +389,46 @@ def run(cmd, log, cancelled, env=None, cwd=None):
     tail = []
 
     def reader():
-        for line in p.stdout:
-            line = line.rstrip()
-            if line:
-                tail.append(line)
-                del tail[:-30]
-                log("  " + line)
+        try:
+            for line in p.stdout:
+                line = line.rstrip()
+                if line:
+                    tail.append(line)
+                    del tail[:-30]
+                    log("  " + line)
+        except (OSError, ValueError):
+            pass
+
     th = threading.Thread(target=reader, daemon=True)
     th.start()
-    while p.poll() is None:
-        if cancelled():
-            p.kill()
-            raise SetupError("Cancelled.")
-        time.sleep(0.2)
-    th.join(5)
+    try:
+        while p.poll() is None:
+            if cancelled():
+                try:
+                    p.terminate()
+                except OSError:
+                    pass
+                try:
+                    p.wait(2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        p.kill()
+                    except OSError:
+                        pass
+                    try:
+                        p.wait(5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                th.join(5)
+                raise SetupError("Cancelled.")
+            time.sleep(0.2)
+        th.join(5)
+    finally:
+        if p.stdout is not None:
+            try:
+                p.stdout.close()
+            except (OSError, ValueError):
+                pass
     if p.returncode != 0:
         raise SetupError("Command failed (exit {}):\n{}".format(p.returncode, "\n".join(tail[-12:])))
 
@@ -732,7 +759,7 @@ def remove_all():
     stop_engine()
     h = home()
     for p in (uv_path(), uv_path() + ".part", os.path.join(h, "env.json"), os.path.join(h, "engine.log"),
-              os.path.join(h, "engine.key")):
+              os.path.join(h, "engine.log.tmp"), os.path.join(h, "engine.key")):
         try:
             os.remove(p)
         except OSError:
@@ -749,10 +776,36 @@ def remove_all():
 # ------------------------------------------------------------------ engine process
 _proc = None
 _proc_lock = threading.Lock()
+_LOG_MAX_BYTES = 2 * 1024 * 1024
+_LOG_KEEP_BYTES = 100 * 1024
+
+
+def _rotate_log(path, max_bytes=_LOG_MAX_BYTES, keep_bytes=_LOG_KEEP_BYTES):
+    """Trim engine.log when it exceeds max_bytes, keeping the last ~keep_bytes on a clean newline boundary."""
+    tmp = path + ".tmp"
+    try:
+        size = os.path.getsize(path)
+        if size <= max_bytes:
+            return
+        with open(path, "rb") as f:
+            f.seek(max(0, size - keep_bytes))
+            tail = f.read()
+        nl = tail.find(b"\n")
+        if nl != -1 and nl + 1 < len(tail):
+            tail = tail[nl + 1:]
+        with open(tmp, "wb") as f:
+            f.write(tail)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def engine_running_here():
-    return _proc is not None and _proc.poll() is None
+    p = _proc
+    return p is not None and p.poll() is None
 
 
 def start_engine(port, model_key):
@@ -770,29 +823,54 @@ def start_engine(port, model_key):
                "--parent-pid", str(os.getpid()), "--idle-exit", "1800"]
         if EDITION == "cpu":
             cmd += ["--device", "cpu"]
-        logf = open(os.path.join(home(), "engine.log"), "a", encoding="utf-8")
-        logf.write("\n==== {} start {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), " ".join(cmd)))
-        logf.flush()
-        kw = {"creationflags": NO_WINDOW} if WIN else {"start_new_session": True}
-        # safe for bandit B603: the engine's own python and server script, a list without a shell
-        _proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,  # nosec B603
-                                 # offline: models come from download_model only. The key goes by the
-                                 # environment, not the command line: other users can read command lines
-                                 env=clean_env({"HF_HUB_OFFLINE": "1", "SEGMENTOT_KEY": key}),
-                                 cwd=home(), **kw)
-        logf.close()
+        log_path = os.path.join(home(), "engine.log")
+        _rotate_log(log_path)
+        logf = open(log_path, "a", encoding="utf-8")
+        try:
+            logf.write("\n==== {} start {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), " ".join(cmd)))
+            logf.flush()
+            kw = {"creationflags": NO_WINDOW} if WIN else {"start_new_session": True}
+            # safe for bandit B603: the engine's own python and server script, a list without a shell
+            _proc = subprocess.Popen(  # nosec B603
+                cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                # offline: models come from download_model only. The key goes by the
+                # environment, not the command line: other users can read command lines
+                env=clean_env({"HF_HUB_OFFLINE": "1", "SEGMENTOT_KEY": key}),
+                cwd=home(), **kw)
+        finally:
+            logf.close()
 
 
-def stop_engine():
+def _reap(proc):
+    try:
+        proc.wait(5)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def stop_engine(wait=True):
     global _proc
+    reap_async = None
     with _proc_lock:
-        if engine_running_here():
-            _proc.terminate()
+        p, _proc = _proc, None
+        if p is not None and p.poll() is None:
             try:
-                _proc.wait(5)
-            except subprocess.TimeoutExpired:
-                _proc.kill()
-        _proc = None
+                p.terminate()
+            except OSError:
+                pass
+            if wait:
+                _reap(p)
+            else:
+                reap_async = p
+    if reap_async is not None:
+        threading.Thread(target=_reap, args=(reap_async,), daemon=True).start()
 
 
 def engine_log_tail(n=15):

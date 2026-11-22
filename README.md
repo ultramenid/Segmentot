@@ -85,8 +85,9 @@ Change, download or delete models in **Settings… → Models**. One model is us
 | SAM 3 | 3.4 GB | Newest; needs approval, see below | [model page](https://huggingface.co/facebook/sam3) |
 
 Measured on an Apple M-series Mac, time to prepare a new view: EdgeTAM 0.12 s on the CPU and 0.03 s on the
-GPU; SAM 2.1 Base+ 0.79 s and 0.27 s. On the test image EdgeTAM's outlines overlap the truth by 97–99%,
-Base+ by 98–100%.
+GPU; SAM 2.1 Base+ 0.79 s and 0.27 s. On the synthetic test suite (buildings, rotated and courtyard shapes,
+nested compounds, small speckled objects, lakes and large fields), EdgeTAM's outlines overlap the truth by
+97–100%, Base+ by 98–100%, with *Square corners* preserving both axis-aligned and rotated shapes.
 
 ### SAM 3 needs approval
 
@@ -134,6 +135,7 @@ Set the environment variable `SEGMENTOT_HOME` to use another folder.
 - **The GPU is not used.** The footer shows what the engine runs on. If the GPU failed, the engine says so
   and continues on the CPU. After a driver update, use **Reinstall…**.
 - **Outlines are cut off at a straight edge.** The object is bigger than the dotted frame: zoom out.
+- **A small object gets a rough outline.** In **More options** set *Detail* to *Map zoom*, zoom in and click it again.
 - **Nothing is found on an online layer.** Wait until the layer has drawn, then click again.
 
 ## How it works

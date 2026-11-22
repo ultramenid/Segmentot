@@ -50,10 +50,15 @@ class SegmentotPlugin:
         self._info = None         # runtime.detect(): looked up the first time the setup steps are shown
         self._engine_ok = None    # None: not started yet · True: answers · False: failed (no automatic retry)
         self._starting = False
+        self._check_seq = 0
+        self._unloaded = False
+        self._tasks = set()
         self.saved = []           # (layer id, fid, added as an edit?) for undo
 
     # ------------------------------------------------------------------ setup
     def initGui(self):
+        self._unloaded = False
+        engine.set_shutting_down(False)
         self.action = QAction(QIcon(os.path.join(runtime.PLUGIN_DIR, "resources", "icon.svg")),
                               "Segmentot: click an object to outline it", self.iface.mainWindow())
         self.action.setCheckable(True)
@@ -61,6 +66,9 @@ class SegmentotPlugin:
         self.iface.addToolBarIcon(self.action)
         self.iface.addPluginToRasterMenu("Segmentot", self.action)
 
+        self._alive = QTimer()                    # the engine exits after 30 idle minutes: not while Start is on
+        self._alive.setInterval(600000)
+        self._alive.timeout.connect(self._engine_answers)
         self.tool = SegmentotTool(self.canvas, self._settings, self._save)
         self.tool.undoSaved.connect(self._undo_saved)
         self.tool.status.connect(lambda s: self.status.setText(s))
@@ -72,11 +80,42 @@ class SegmentotPlugin:
         self._startup.start(2000)
 
     def unload(self):
+        self._unloaded = True
+        self._check_seq += 1
+        engine.set_shutting_down(True)
         self._startup.stop()
-        self.canvas.destinationCrsChanged.disconnect(self._new_imagery)
-        runtime.stop_engine()
+        self._alive.stop()
+        if self._setup_dlg is not None:
+            try:
+                self._setup_dlg.finishedOk.disconnect(self._installed)
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                self._setup_dlg.failed.disconnect(self._refresh)
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                if self._setup_dlg.running and self._setup_dlg.task is not None:
+                    self._setup_dlg.task.cancel()
+                self._setup_dlg.close()
+            except RuntimeError:
+                pass
+            self._setup_dlg = None
+        for t in list(self._tasks):
+            try:
+                t.cancel()
+            except RuntimeError:
+                pass
         if self.canvas.mapTool() is self.tool:
             self.canvas.unsetMapTool(self.tool)
+        self.tool.cleanup()
+        self.tool.deleteLater()
+        self._watch_style(None)
+        try:
+            self.canvas.destinationCrsChanged.disconnect(self._new_imagery)
+        except (RuntimeError, TypeError):
+            pass
+        runtime.stop_engine()
         self.iface.removeToolBarIcon(self.action)
         self.iface.removePluginRasterMenu("Segmentot", self.action)
         self.iface.removeDockWidget(self.dock)
@@ -260,7 +299,8 @@ class SegmentotPlugin:
         f.addRow("Outline", self.outline)
         self.hover = QCheckBox("Preview under the cursor")
         self.hover.setChecked(QSettings().value("Segmentot/hover", True, type=bool))
-        self.hover.toggled.connect(lambda on: QSettings().setValue("Segmentot/hover", on))
+        self.hover.toggled.connect(self._hover_toggled)
+        self.tool.set_hover_enabled(self.hover.isChecked())
         f.addRow(self.hover)
         self.fill_holes = QCheckBox("Fill holes")
         self.square = QCheckBox("Square corners (buildings)")
@@ -293,10 +333,30 @@ class SegmentotPlugin:
         for sig in (self.raster.layerChanged, self.detail.currentIndexChanged, self.canvas.destinationCrsChanged):
             sig.connect(self._new_imagery)
         self.outline.currentIndexChanged.connect(lambda *a: self.tool.resend())
+        self._styled = None
+        self._watch_style(self.raster.currentLayer())
         self._idle_hint()
         return page
 
+    def _hover_toggled(self, on):
+        QSettings().setValue("Segmentot/hover", on)
+        self.tool.set_hover_enabled(on)
+
+    def _watch_style(self, layer):
+        """A new stretch or band choice changes what the AI sees: the views rendered before it are stale."""
+        if layer is self._styled:
+            return
+        try:
+            if self._styled is not None:
+                self._styled.styleChanged.disconnect(self.tool.drop_views)
+        except (RuntimeError, TypeError):      # that layer is already deleted
+            pass
+        if layer is not None:
+            layer.styleChanged.connect(self.tool.drop_views)
+        self._styled = layer
+
     def _new_imagery(self, *_):
+        self._watch_style(self.raster.currentLayer())
         self.tool.new_imagery()
         self._idle_hint()
 
@@ -327,6 +387,8 @@ class SegmentotPlugin:
         }
 
     def _start_stop(self, on):
+        if self._unloaded:
+            return
         if on and not (self._ready() and self.raster.currentLayer() is not None):
             self.start_btn.setChecked(False)
             self._refresh()
@@ -336,6 +398,7 @@ class SegmentotPlugin:
         self.keys.setVisible(on)
         self.start_btn.setText("■  Stop" if on else "▶  Start")
         if on:
+            self._alive.start()
             if self.detail.currentIndex() == 0 and self._settings()["grid"] is None:
                 self.status.setText("Hover over an object, then left-click it.\n(Using the map zoom: raster pixels "
                                     "need a local raster in the project's CRS, with square pixels.)")
@@ -344,6 +407,7 @@ class SegmentotPlugin:
             self.canvas.setMapTool(self.tool)
         else:
             try:
+                self._alive.stop()
                 if self.canvas.mapTool() is self.tool:
                     self.canvas.unsetMapTool(self.tool)
             except RuntimeError:      # canvas already gone (QGIS closing)
@@ -356,6 +420,9 @@ class SegmentotPlugin:
         port = int(QSettings().value("Segmentot/port", 8776))
         model = QSettings().value("Segmentot/model", "") or st.get("model") or (self._info or {}).get("model")
         return port, model if model in runtime.MODELS else "base"
+
+    def _model_window_px(self, model_key):
+        return 1008 if model_key == "sam3" else 1024
 
     def _force_cpu(self):
         return runtime.EDITION == "cpu" or QSettings().value("Segmentot/force_cpu", False, type=bool)
@@ -372,7 +439,12 @@ class SegmentotPlugin:
 
     def _refresh(self, *_):
         """Show the setup steps until the engine and its model are here, then the work screen."""
-        engine.configure(*self._engine_cfg())
+        if self._unloaded:
+            return
+        port, model = self._engine_cfg()
+        engine.configure(port, model)
+        if not self._engine_ok:
+            self.tool.set_window_px(self._model_window_px(model))
         ready = self._ready()
         self.setup_page.setVisible(not ready)
         self.work_page.setVisible(ready)
@@ -386,7 +458,9 @@ class SegmentotPlugin:
     def _fill_setup(self):
         if self._info is None:
             self._info = runtime.detect()
-            engine.configure(*self._engine_cfg())       # the model that fits this computer
+            port, model = self._engine_cfg()
+            engine.configure(port, model)       # the model that fits this computer
+            self.tool.set_window_px(self._model_window_px(model))
         info, model = self._info, self._engine_cfg()[1]
         busy = self._setup_dlg.mode if self._setup_dlg is not None and self._setup_dlg.running else None
         installed, have_model = runtime.is_ready(), runtime.model_downloaded(model)
@@ -446,6 +520,8 @@ class SegmentotPlugin:
         b = QPushButton("Open setup")
 
         def go():
+            if self._unloaded:
+                return
             bar.popWidget(item)
             self.dock.show()
             self.dock.raise_()
@@ -504,6 +580,8 @@ class SegmentotPlugin:
         self._run_setup("model", model)
 
     def _installed(self):
+        if self._unloaded:
+            return
         if not runtime.model_downloaded(self._engine_cfg()[1]):
             have = [k for k in runtime.MODELS if runtime.model_downloaded(k)]
             if have:                            # the engine package came with another model: use that one
@@ -536,8 +614,16 @@ class SegmentotPlugin:
         if dlg.reinstall:
             return self._install()
         if not dlg.removed and (new_port, new_model) != (port, model):
+            self._check_seq += 1
+            self._starting = False
+            for t in list(self._tasks):
+                try:
+                    t.cancel()
+                except RuntimeError:
+                    pass
             runtime.stop_engine()
             engine.configure(new_port, new_model)
+            self.tool.set_window_px(self._model_window_px(new_model))
             self.tool.new_imagery()
         if dlg.download:
             return self._get_model(new_model)
@@ -546,19 +632,35 @@ class SegmentotPlugin:
 
     def _check_engine(self):
         """Start the engine in the background; the footer says how it went."""
-        if self._starting or not self._ready():
+        if self._unloaded or self._starting or not self._ready():
             return
         self._starting = True
+        self._check_seq += 1
+        my_seq = self._check_seq
         self.engine_label.setText("<small>Engine: starting (loading the model takes 10–30 s the first time)…</small>")
+        task_ref = [None]
 
         def done(exc, r=None):
+            t = task_ref[0]
+            if t is not None:
+                QTimer.singleShot(0, lambda t=t: self._tasks.discard(t))
+            if self._unloaded or my_seq != self._check_seq:
+                return
             self._starting = False
+            if t is not None and t.isCanceled():
+                return
+            if exc is None and (r is None or r.get("api") != engine.API):
+                exc = ("An engine of another Segmentot version is already running on this port (another QGIS?). "
+                       "Close that QGIS, or change the port in Settings….")
             if exc is not None:
                 self._engine_ok = False
                 self.engine_label.setText("<b>Engine problem:</b> {} <a href='retry'>Try again</a>".format(
                     html.escape(str(exc)).replace("\n", "<br>")))
                 return
             self._engine_ok = True
+            self.tool.set_device(r.get("device"))
+            if r.get("image_size"):
+                self.tool.set_window_px(int(r["image_size"]))
             st = runtime.load_state()
             where = "" if runtime.engine_running_here() else " (already running engine)"
             dev = "CPU" if r.get("device") == "cpu" else r.get("gpu") or "CPU"   # "cpu" after a GPU fallback
@@ -568,10 +670,17 @@ class SegmentotPlugin:
             lines += [n.replace("\n", "<br>") for n in st.get("detected", {}).get("notes", [])
                       if "flatpak override" in n and not st.get("torch", {}).get("cuda")]
             self.engine_label.setText("<small>" + "<br>".join(lines) + "</small>")
-        self._health = QgsTask.fromFunction(
-            "Segmentot engine", lambda t: engine.call("/health", timeout=600, headers={"X-Segmentot": "load"}),
-            on_finished=done)
-        QgsApplication.taskManager().addTask(self._health)
+
+        task = QgsTask.fromFunction(
+            "Segmentot engine",
+            lambda t: engine.call("/health", timeout=600, headers={"X-Segmentot": "load"}, cancelled=t.isCanceled),
+            on_finished=done,
+            flags=QgsTask.Flag.CanCancel,
+        )
+        task_ref[0] = task
+        self._health = task
+        self._tasks.add(task)
+        QgsApplication.taskManager().addTask(task)
 
     # ------------------------------------------------------------------ output
     def _style(self, lyr):

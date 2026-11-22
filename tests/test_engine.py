@@ -21,10 +21,10 @@ sys.path.insert(0, os.environ.get("SEGMENTOT_TEST_PARENT") or
 
 from osgeo import gdal  # noqa: E402
 from qgis.core import (  # noqa: E402
-    QgsApplication, QgsCoordinateReferenceSystem, QgsGeometry, QgsPointXY, QgsRasterLayer, QgsRectangle,
+    QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry, QgsPointXY, QgsProject,
+    QgsRasterLayer, QgsRasterRange, QgsRectangle,
 )
-from qgis.PyQt.QtCore import QByteArray, QEventLoop, QTimer  # noqa: E402
-from qgis.PyQt.QtGui import QImage  # noqa: E402
+from qgis.PyQt.QtCore import QEventLoop, QTimer  # noqa: E402
 
 gdal.UseExceptions()
 APP = QgsApplication([], False)
@@ -39,6 +39,60 @@ OPTS = {"expand": 0, "simplify": 0, "min_area_m2": 0, "fill_holes": False, "squa
 
 def ring(g):
     return g.asPolygon()[0][:-1]
+
+
+def iou(a, b):
+    inter = a.intersection(b)
+    ia = inter.area() if inter is not None and not inter.isEmpty() else 0.0
+    ua = a.area() + b.area() - ia
+    return ia / ua if ua > 0 else 0.0
+
+
+def count_right_angle_corners(pts, kx=1.0):
+    corners = 0
+    for i, p in enumerate(pts):
+        u, v = pts[i - 1], pts[(i + 1) % len(pts)]
+        ax, ay = (u.x() - p.x()) * kx, u.y() - p.y()
+        bx, by = (v.x() - p.x()) * kx, v.y() - p.y()
+        cos = (ax * bx + ay * by) / math.hypot(ax, ay) / math.hypot(bx, by)
+        if abs(cos) < 0.02:
+            corners += 1
+        elif cos >= -0.999:
+            return -1
+    return corners
+
+
+def make_rect(cx, cy, w, h, deg, kx=1.0):
+    a = math.radians(deg)
+    c, s = math.cos(a), math.sin(a)
+    pts = [QgsPointXY(cx + (dx * c - dy * s) / kx, cy + dx * s + dy * c)
+           for dx, dy in ((-w / 2, -h / 2), (w / 2, -h / 2), (w / 2, h / 2), (-w / 2, h / 2))]
+    return QgsGeometry.fromPolygonXY([pts + [pts[0]]])
+
+
+def rasterize(gt, origin_x=0.0, origin_y=0.0, px=1.0, pad=4):
+    bb = gt.boundingBox()
+    ix0 = int(math.floor((bb.xMinimum() - origin_x) / px)) - pad
+    iy0 = int(math.floor((bb.yMinimum() - origin_y) / px)) - pad
+    ix1 = int(math.ceil((bb.xMaximum() - origin_x) / px)) + pad
+    iy1 = int(math.ceil((bb.yMaximum() - origin_y) / px)) + pad
+    rows = []
+    for iy in range(iy0, iy1):
+        yc = origin_y + (iy + 0.5) * px
+        xs = [ix for ix in range(ix0, ix1) if gt.contains(QgsPointXY(origin_x + (ix + 0.5) * px, yc))]
+        if xs:
+            run_s = prev = xs[0]
+            for ix in xs[1:]:
+                if ix != prev + 1:
+                    rows.append(QgsGeometry.fromRect(QgsRectangle(
+                        origin_x + run_s * px, origin_y + iy * px,
+                        origin_x + (prev + 1) * px, origin_y + (iy + 1) * px)))
+                    run_s = ix
+                prev = ix
+            rows.append(QgsGeometry.fromRect(QgsRectangle(
+                origin_x + run_s * px, origin_y + iy * px,
+                origin_x + (prev + 1) * px, origin_y + (iy + 1) * px)))
+    return engine.polygons_only(QgsGeometry.unaryUnion(rows))
 
 
 class PixelPolys(unittest.TestCase):
@@ -64,38 +118,95 @@ class Refine(unittest.TestCase):
         self.assertGreaterEqual(out.area() / g.area(), 0.99)
 
     def test_square_corners_on_a_pixel_staircase(self):
-        for deg in (20, 30):
+        for deg in range(0, 50, 5):
             with self.subTest(deg=deg):
-                stair = self.staircase(deg)
-                self.assertGreater(len(ring(stair)), 50)
+                gt = make_rect(100.0, 100.0, 100.0, 50.0, deg)
+                stair = rasterize(gt)
                 out = engine.refine(stair, dict(OPTS, square=True), 1.0, CRS)
-                pts = ring(out)
-                corners = 0
-                for i, p in enumerate(pts):
-                    u, v = pts[i - 1], pts[(i + 1) % len(pts)]
-                    ax, ay, bx, by = u.x() - p.x(), u.y() - p.y(), v.x() - p.x(), v.y() - p.y()
-                    cos = (ax * bx + ay * by) / math.hypot(ax, ay) / math.hypot(bx, by)
-                    if abs(cos) < 0.02:
-                        corners += 1
-                    else:
-                        self.assertLess(cos, -0.999)           # any other vertex lies on a straight edge
-                self.assertEqual(corners, 4)
-                self.assertAlmostEqual(out.area() / stair.area(), 1, delta=0.03)
+                self.assertTrue(out.isGeosValid())
+                self.assertEqual(count_right_angle_corners(ring(out)), 4)
+                self.assertGreaterEqual(iou(out, gt), 0.98)
+                self.assertAlmostEqual(out.area() / gt.area(), 1.0, delta=0.01)
 
-    @staticmethod
-    def staircase(deg):
-        """Pixel-edge outline of a 120 x 60 px rectangle rotated by deg, as the engine returns it."""
-        a, cx, cy = math.radians(deg), 100.0, 100.0
-        rows = []
-        for y in range(200):
-            xs = [x for x in range(200)
-                  if abs((x + .5 - cx) * math.cos(a) + (y + .5 - cy) * math.sin(a)) <= 60 and
-                  abs(-(x + .5 - cx) * math.sin(a) + (y + .5 - cy) * math.cos(a)) <= 30]
-            if xs:
-                rows.append(QgsGeometry.fromRect(QgsRectangle(xs[0], y, xs[-1] + 1, y + 1)))
-        r = ring(QgsGeometry.unaryUnion(rows))
-        i = min(range(len(r)), key=lambda k: (r[k].y(), r[k].x()))   # GDAL/rasterio start at the first pixel
-        return QgsGeometry.fromPolygonXY([r[i:] + r[:i] + [r[i]]])
+    def test_square_corners_axis_aligned_with_rounded_corners(self):
+        # 80x50 axis-aligned rectangle with 2-px chamfered corners like SAM outputs
+        pts = [
+            QgsPointXY(162, 175), QgsPointXY(162, 176), QgsPointXY(161, 176), QgsPointXY(161, 177),
+            QgsPointXY(160, 177), QgsPointXY(160, 224), QgsPointXY(161, 224), QgsPointXY(161, 225),
+            QgsPointXY(239, 225), QgsPointXY(239, 223), QgsPointXY(240, 223), QgsPointXY(240, 177),
+            QgsPointXY(239, 177), QgsPointXY(239, 176), QgsPointXY(238, 176), QgsPointXY(238, 175),
+            QgsPointXY(162, 175),
+        ]
+        g = QgsGeometry.fromPolygonXY([pts])
+        gt = QgsGeometry.fromRect(QgsRectangle(160, 175, 240, 225))
+        out = engine.refine(g, dict(OPTS, square=True), 1.0, CRS)
+        self.assertEqual(count_right_angle_corners(ring(out)), 4)
+        self.assertGreaterEqual(iou(out, gt), 0.99)
+        self.assertAlmostEqual(out.area() / gt.area(), 1.0, delta=0.01)
+
+    def test_square_corners_small_rotated_buildings(self):
+        for w, h in ((12, 12), (16, 16), (20, 20), (30, 15)):
+            with self.subTest(size=(w, h)):
+                gt = make_rect(50.0, 50.0, float(w), float(h), 25)
+                stair = rasterize(gt)
+                out = engine.refine(stair, dict(OPTS, square=True), 1.0, CRS)
+                self.assertEqual(count_right_angle_corners(ring(out)), 4)
+                self.assertGreaterEqual(iou(out, gt), 0.95)
+                self.assertAlmostEqual(out.area() / gt.area(), 1.0, delta=0.02)
+
+    def test_square_corners_l_shape_and_courtyard(self):
+        a = math.radians(25)
+        c, s = math.cos(a), math.sin(a)
+        l_local = [(0, 0), (80, 0), (80, 30), (35, 30), (35, 70), (0, 70), (0, 0)]
+        l_gt = QgsGeometry.fromPolygonXY([[QgsPointXY(100 + x * c - y * s, 100 + x * s + y * c) for x, y in l_local]])
+        l_out = engine.refine(rasterize(l_gt), dict(OPTS, square=True), 1.0, CRS)
+        self.assertTrue(l_out.isGeosValid())
+        self.assertEqual(count_right_angle_corners(ring(l_out)), 6)
+        self.assertGreaterEqual(iou(l_out, l_gt), 0.96)
+
+        a = math.radians(20)
+        c, s = math.cos(a), math.sin(a)
+        ext = [(-50, -40), (50, -40), (50, 40), (-50, 40), (-50, -40)]
+        hole = [(-20, -15), (-20, 15), (20, 15), (20, -15), (-20, -15)]
+        cy_gt = QgsGeometry.fromPolygonXY([
+            [QgsPointXY(100 + x * c - y * s, 100 + x * s + y * c) for x, y in ext],
+            [QgsPointXY(100 + x * c - y * s, 100 + x * s + y * c) for x, y in hole],
+        ])
+        cy_out = engine.refine(rasterize(cy_gt), dict(OPTS, square=True), 1.0, CRS)
+        self.assertTrue(cy_out.isGeosValid())
+        rings = cy_out.asPolygon()
+        self.assertEqual(len(rings), 2)
+        self.assertEqual(count_right_angle_corners(rings[0][:-1]), 4)
+        self.assertEqual(count_right_angle_corners(rings[1][:-1]), 4)
+        self.assertGreaterEqual(iou(cy_out, cy_gt), 0.96)
+
+    def test_square_corners_geographic_crs_high_latitude(self):
+        crs_geo = QgsCoordinateReferenceSystem("EPSG:4326")
+        px_deg = 1e-5
+        kx = math.cos(math.radians(60.0))
+        for deg in (15, 30):
+            with self.subTest(deg=deg):
+                gt = make_rect(10.0, 60.0, 80 * px_deg, 50 * px_deg, deg, kx=kx)
+                stair = rasterize(gt, origin_x=10.0, origin_y=60.0, px=px_deg)
+                out = engine.refine(stair, dict(OPTS, square=True), px_deg, crs_geo)
+                self.assertTrue(out.isGeosValid())
+                self.assertEqual(count_right_angle_corners(ring(out), kx=kx), 4)
+                self.assertGreaterEqual(iou(out, gt), 0.97)
+
+    def test_square_corners_multipolygon_and_circle_safeguard(self):
+        gt1 = make_rect(60.0, 60.0, 50.0, 30.0, 0)
+        gt2 = make_rect(200.0, 60.0, 60.0, 30.0, 30)
+        mp = QgsGeometry.unaryUnion([rasterize(gt1), rasterize(gt2)])
+        out = engine.refine(mp, dict(OPTS, square=True), 1.0, CRS)
+        self.assertTrue(out.isMultipart())
+        parts = out.asMultiPolygon()
+        self.assertEqual(len(parts), 2)
+        for p in parts:
+            self.assertEqual(count_right_angle_corners(p[0][:-1]), 4)
+
+        circle = rasterize(QgsGeometry.fromPointXY(QgsPointXY(100, 100)).buffer(30.0, 32))
+        sq_circle = engine.refine(circle, dict(OPTS, square=True), 1.0, CRS)
+        self.assertGreaterEqual(iou(sq_circle, circle), 0.85)
 
     def test_expand(self):
         g = QgsGeometry.fromRect(QgsRectangle(0, 0, 100, 50))
@@ -126,13 +237,13 @@ class Render(unittest.TestCase):
         cls.layer = None
         cls.tmp.cleanup()
 
-    def render(self, cancel=False):
+    def render(self, cancel=False, layer=None, extent=QgsRectangle(-50, -50, 150, 150), crs=CRS, size=WINDOW_PX):
         got, loop = [], QEventLoop()
 
         def on_done(img):
             got.append(img)
             loop.quit()
-        job = engine.render_window(self.layer, QgsRectangle(-50, -50, 150, 150), WINDOW_PX, CRS, on_done)
+        job = engine.render_window(layer or self.layer, extent, size, crs, on_done)
         if cancel:
             job.cancelWithoutBlocking()
         QTimer.singleShot(20000, loop.quit)
@@ -154,14 +265,96 @@ class Render(unittest.TestCase):
     def test_render_window(self):
         self.check(self.render())
 
-    def test_encode_png_in_a_thread_keeps_alpha(self):
+    def test_rgba_bytes_in_a_thread(self):
         img, out = self.render(), []
-        t = threading.Thread(target=lambda: out.append(engine.encode_png(img)))
+        t = threading.Thread(target=lambda: out.append(engine.rgba_bytes(img)))
         t.start()
         t.join()
-        back = QImage.fromData(QByteArray.fromBase64(out[0].encode()), "PNG")
-        self.assertTrue(back.hasAlphaChannel())
-        self.check(back)
+        raw = out[0]
+        self.assertEqual(len(raw), WINDOW_PX * WINDOW_PX * 4)
+
+        def px(x, y):
+            i = (y * WINDOW_PX + x) * 4
+            return tuple(raw[i:i + 4])
+        self.assertEqual(px(100, 100)[3], 0)                                # no imagery
+        self.assertEqual(px(400, 400), (200, 120, 60, 255))                 # row by row, R G B A
+        self.assertEqual(px(614, 614), (0, 0, 0, 255))
+        self.assertEqual(px(400, 614), (200, 120, 60, 255))                 # same column, beside the block
+
+    def test_zoomed_out_raster_without_overviews_is_averaged(self):
+        path = os.path.join(self.tmp.name, "checker.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, 400, 400, 3, gdal.GDT_Byte)
+        ds.SetGeoTransform((0, 1, 0, 400, 0, -1))
+        ds.SetProjection(CRS.toWkt())
+        checker = bytes((x + y) % 2 * 255 for y in range(400) for x in range(400))     # 1-pixel checkerboard
+        for b in (1, 2, 3):
+            ds.GetRasterBand(b).WriteRaster(0, 0, 400, 400, checker)
+        ds = None
+        layer = QgsRasterLayer(path, "checker", "gdal")
+        extent = QgsRectangle(0, 400 - 4 * WINDOW_PX, 4 * WINDOW_PX, 400)          # 4 raster pixels per window pixel
+        img = self.render(layer=layer, extent=extent)
+        reds = [img.pixelColor(x, y).red() for x in range(2, 98, 5) for y in range(2, 98, 5)]
+        self.assertTrue(all(abs(r - 128) <= 8 for r in reds), sorted(set(reds)))       # grey, not black and white
+        layer.dataProvider().setUserNoDataValue(1, [QgsRasterRange(0, 0)])             # "additional no data value"
+        ds = gdal.Open(path, gdal.GA_Update)
+        ds.GetRasterBand(1).WriteRaster(0, 0, 200, 400, bytes(200 * 400))              # left half: all no-data
+        ds = None
+        layer.dataProvider().reloadData()
+        img = self.render(layer=layer, extent=extent)
+        self.assertEqual((img.pixelColor(20, 50).alpha(), img.pixelColor(80, 50).alpha()), (0, 255))
+        layer.dataProvider().enableProviderResampling(True)          # a resampling chosen by the user is kept
+        self.assertIn(self.render(layer=layer, extent=extent).pixelColor(80, 50).green(), (0, 255))
+
+    def test_zoomed_out_16x_and_reprojected_raster_is_averaged(self):
+        width = 1024
+        path = os.path.join(self.tmp.name, "checker16.tif")
+        ds = gdal.GetDriverByName("GTiff").Create(path, width, width, 3, gdal.GDT_Byte)
+        ds.SetGeoTransform((500000.0, 1.0, 0.0, 5500000.0 + width, 0.0, -1.0))
+        ds.SetProjection(CRS.toWkt())
+        checker = bytes((x + y) % 2 * 255 for y in range(width) for x in range(width))
+        for b in (1, 2, 3):
+            ds.GetRasterBand(b).WriteRaster(0, 0, width, width, checker)
+        ds = None
+        layer = QgsRasterLayer(path, "checker16", "gdal")
+        self.assertTrue(layer.isValid())
+
+        # 16x zoom-out without overviews (>8x default maxOversampling)
+        size = 128
+        ext16 = QgsRectangle(500000.0, 5500000.0 + width - 16 * size, 500000.0 + 16 * size, 5500000.0 + width)
+        img16 = self.render(layer=layer, extent=ext16, crs=CRS, size=size)
+        reds16 = [img16.pixelColor(x, y).red() for x in range(4, 60, 4) for y in range(4, 60, 4)]
+        self.assertTrue(all(abs(r - 128) <= 8 for r in reds16), sorted(set(reds16)))
+
+        # 4x zoomed-out reprojected UTM -> EPSG:3857
+        crs_3857 = QgsCoordinateReferenceSystem("EPSG:3857")
+        ct = QgsCoordinateTransform(CRS, crs_3857, QgsProject.instance().transformContext())
+        center = ct.transformBoundingBox(layer.extent()).center()
+        # At ~49.65 deg N, 4 m UTM ~ 6.18 m in EPSG:3857; 128 px * 6.18 m = 791 m
+        half = 128 * 6.18 / 2.0
+        ext_reproj = QgsRectangle(center.x() - half, center.y() - half, center.x() + half, center.y() + half)
+        img_rp = self.render(layer=layer, extent=ext_reproj, crs=crs_3857, size=size)
+        reds_rp = [img_rp.pixelColor(x, y).red() for x in range(20, 108, 6) for y in range(20, 108, 6)]
+        self.assertTrue(all(abs(r - 128) <= 8 for r in reds_rp), sorted(set(reds_rp)))
+
+    def test_native_grid_north_up_vs_rotated(self):
+        self.assertEqual(engine.native_grid(self.layer, CRS), (1.0, 0.0, 100.0))
+        self.assertIsNone(engine.native_grid(self.layer, QgsCoordinateReferenceSystem("EPSG:3857")))
+        cases = (
+            ("rot15", (500000.0, math.cos(math.radians(15)), -math.sin(math.radians(15)),
+                       5500100.0, -math.sin(math.radians(15)), -math.cos(math.radians(15)))),
+            ("rot90", (500000.0, 0.0, 1.0, 5500100.0, 1.0, 0.0)),
+            ("southup", (500000.0, 1.0, 0.0, 5500000.0, 0.0, 1.0)),
+        )
+        for name, gt in cases:
+            with self.subTest(name=name):
+                path = os.path.join(self.tmp.name, "{}.tif".format(name))
+                ds = gdal.GetDriverByName("GTiff").Create(path, 100, 100, 1, gdal.GDT_Byte)
+                ds.SetGeoTransform(gt)
+                ds.SetProjection(CRS.toWkt())
+                ds = None
+                lyr = QgsRasterLayer(path, name, "gdal")
+                self.assertTrue(lyr.isValid())
+                self.assertIsNone(engine.native_grid(lyr, CRS))
 
     def test_cancelled_render_still_calls_back(self):
         self.render(cancel=True)

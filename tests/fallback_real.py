@@ -1,13 +1,10 @@
 """Real-model GPU -> CPU fallback: load SAM2.1 on the GPU, segment, inject a GPU failure, check the CPU takes over."""
-import base64
 import importlib.util
-import io
 import os
 import sys
 import time
 
 import numpy as np
-from PIL import Image
 
 # run with the engine's own Python (<engine folder>/venv/bin/python): the model is read from that folder, offline
 os.environ.setdefault("HF_HOME", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(sys.executable))), "hf"))
@@ -29,9 +26,8 @@ img = np.zeros((1024, 1024, 4), np.uint8)
 img[..., 3] = 255
 img[..., :3] = np.clip(np.array([70, 110, 60]) + rng.normal(0, 6, (1024, 1024, 3)), 1, 255)
 img[400:520, 300:500, :3] = (200, 60, 50)  # truth: 200 x 120 px = 24000 px2
-buf = io.BytesIO()
-Image.fromarray(img, "RGBA").save(buf, "PNG")
-req = {"image_id": "a", "image": base64.b64encode(buf.getvalue()).decode(), "points": [[400.0, 460.0]], "labels": [1]}
+px = img.tobytes()
+req = {"image_id": "a", "size": [1024, 1024], "points": [[400.0, 460.0]], "labels": [1]}
 
 
 def area(res):
@@ -49,7 +45,7 @@ def check(name, cond, detail=""):
 
 
 t = time.time()
-r1 = srv.predict(dict(req))
+r1 = srv.predict(dict(req), px)
 t1 = time.time() - t
 check(
     "GPU run gives the rectangle",
@@ -70,12 +66,13 @@ def boom(*a, **k):
 
 
 model.forward = boom
-r2 = srv.predict({k: v for k, v in req.items() if k != "image"})  # image is cached -> fails on the GPU
+r2 = srv.predict(dict(req))  # image is cached -> fails on the GPU
 check("GPU failure switches the engine to the CPU", srv.S["device"] == "cpu" and r2 == {"need_image": True}, r2)
 check("notice tells the user", bool(srv.S["notice"]) and "CPU" in srv.S["notice"], srv.S["notice"])
-check("model weights really moved to the CPU", next(model.parameters()).device.type == "cpu")
+check("model weights really moved to the CPU, in float32",
+      next(model.parameters()).device.type == "cpu" and model.dtype == srv.torch.float32)
 t = time.time()
-r3 = srv.predict(dict(req))
+r3 = srv.predict(dict(req), px)
 t3 = time.time() - t
 check(
     "the resent request succeeds on the CPU with the same outline",
